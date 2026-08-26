@@ -1,0 +1,18 @@
+# Build artifacts
+dist/
+Horidoro-AV-for-You.zip
+horidoro-av.py
+checksums.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Local junk
+*.log
+
+# Environment / credentials
+*.env
+
+# Local-only content
+private/
