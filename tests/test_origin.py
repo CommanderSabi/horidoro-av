@@ -67,6 +67,22 @@ check("chooser restore works", os.path.exists(os.path.join(pick, "false-positive
 check("origin entry pruned after chooser restore",
       actions.get_origin("false-positive.exe") is None)
 
+# 4b. restore NEVER overwrites — if a file already sits at the destination
+# (e.g. Steam re-downloaded it), the quarantined copy stays put
+open(original, "w").write("MZ-original-again")
+os.rename(original, qfile)
+actions.record_origin("/home/user/Downloads/false-positive.exe")
+occupied = os.path.join(pick, "false-positive.exe")  # exists from test 4
+ok = actions.restore_quarantined("false-positive.exe", pick)
+check("chooser restore refuses to overwrite an existing file", ok is False)
+check("quarantined copy kept when the target exists", qfile.exists())
+check("existing file untouched by a refused restore",
+      os.path.exists(occupied))
+# and the origin is not pruned on a refused restore (nothing was restored)
+check("origin kept after a refused restore",
+      actions.get_origin("false-positive.exe")
+      == "/home/user/Downloads/false-positive.exe")
+
 # 5. scripts' best-effort origins (origins.tmp) get merged
 actions.TMP_DIR.mkdir(parents=True, exist_ok=True)
 (actions.TMP_DIR / "origins.tmp").write_text(
@@ -76,6 +92,36 @@ check("script origin merged", actions.get_origin("evil.exe")
       str(actions.get_origin("evil.exe")))
 check("origins.tmp cleared after merge",
       not (actions.TMP_DIR / "origins.tmp").exists())
+
+# 5b. merged lines carry WHO caught the file (daily scan / watcher / …);
+# legacy 2-field lines merge with no source
+(actions.QUARANTINE_DIR / "a.exe").write_bytes(b"MZ-a")
+(actions.QUARANTINE_DIR / "b.exe").write_bytes(b"MZ-b")
+(actions.TMP_DIR / "origins.tmp").write_text(
+    "a.exe|/home/user/Downloads/a.exe|watcher\n"
+    "b.exe|/home/user/Pictures/b.exe\n")
+check("3-field line records the source", actions.get_source("a.exe")
+      == "watcher", str(actions.get_source("a.exe")))
+check("legacy 2-field line merges with no source",
+      actions.get_source("b.exe") is None
+      and actions.get_origin("b.exe") == "/home/user/Pictures/b.exe")
+check("quarantine list carries the source",
+      any(e["name"] == "a.exe" and e.get("source") == "watcher"
+          for e in actions.list_quarantine()))
+(actions.TMP_DIR / "origins.tmp").unlink(missing_ok=True)
+
+# 5c. record_origin stamps the source too
+actions.record_origin("/home/user/Downloads/c.exe", by="manual scan")
+check("record_origin stores the source",
+      actions.get_source("c.exe") == "manual scan")
+
+# 5d. legacy plain-string origin.json entries survive (normalized on load)
+import json as _json  # noqa: E402
+(actions.QUARANTINE_DIR / "origin.json").write_text(
+    _json.dumps({"old.exe": "/home/user/Old/old.exe"}))
+check("legacy string origin normalized",
+      actions.get_origin("old.exe") == "/home/user/Old/old.exe"
+      and actions.get_source("old.exe") is None)
 
 # 6. VERBOSE scans record origins from the clamscan log's FOUND lines
 # (the scan scripts record origins themselves; the verbose manual-scan path

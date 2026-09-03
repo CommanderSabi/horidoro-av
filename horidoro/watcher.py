@@ -63,6 +63,12 @@ _WATCH_MASK = (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE
 # (scanning the partials is wasteful and can race the downloader).
 _SKIP_SUFFIXES = (".crdownload", ".part", ".partial", ".download",
                   ".opdownload", ".tmp")
+# Chromium-style download temps have RANDOM names (.org.chromium.Chromium.xxxx)
+# — no suffix to catch, so match the basename prefix (found live on Bazzite:
+# scanning them mid-download raced the browser -> "Can't access file" ERRORs
+# + an-error-occurred sound on every download).
+_SKIP_PREFIXES = (".org.chromium.Chromium.", ".com.google.Chrome.",
+                  ".com.brave.Browser.", ".com.microsoft.Edge.")
 
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.inotify_init1.argtypes = [ctypes.c_int]
@@ -352,7 +358,9 @@ class Watcher:
     def _emit(self, path):
         if self._is_excluded(path):
             return
-        if path.lower().endswith(_SKIP_SUFFIXES):
+        base = os.path.basename(path)
+        if path.lower().endswith(_SKIP_SUFFIXES) or \
+                base.startswith(_SKIP_PREFIXES):
             return  # download-in-progress marker — the rename will be scanned
         try:
             st = os.stat(path)

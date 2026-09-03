@@ -132,6 +132,25 @@ check("watcher: .crdownload partial is ignored",
 check("watcher: final rename after download is scanned",
       any("eicar_com.zip" in x for x in seen5), str(seen5))
 
+# 6. Chromium-style download temps (random names, .org.chromium.Chromium.xxxx)
+# must ALSO be ignored — scanning them mid-download raced the browser and
+# produced "Can't access file" ERRORs + error sounds on every download
+w6 = tempfile.mkdtemp(prefix="horidoro-chromium-")
+seen6 = []
+watcher6 = Watcher([w6], seen6.append)
+watcher6.start()
+time.sleep(0.5)
+chromium_partial = os.path.join(w6, ".org.chromium.Chromium.6rZ7YK")
+open(chromium_partial, "w").write("half of a download")
+time.sleep(2.5)
+os.rename(chromium_partial, os.path.join(w6, "eicar_com.zip"))
+time.sleep(3.0)
+watcher6.stop()
+check("watcher: Chromium temp partial is ignored",
+      not any(".org.chromium.Chromium" in x for x in seen6), str(seen6))
+check("watcher: final rename after Chromium download is scanned",
+      any("eicar_com.zip" in x for x in seen6), str(seen6))
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

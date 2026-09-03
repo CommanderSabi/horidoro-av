@@ -80,6 +80,7 @@ fi
 
 bash @SCRIPT_DIR@/update.sh
 mkdir -p @TMP_DIR@ @QUARANTINE_DIR@
+RUN_START=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
 distrobox enter -n @CONTAINER@ -- bash -c "
     touch \"$LOCK_FILE\"
@@ -90,7 +91,7 @@ distrobox enter -n @CONTAINER@ -- bash -c "
         clamdscan --ping --wait > /dev/null 2>&1
     fi
 
-    if [ "@DAILY_PATHS_SET@" = "1" ]; then
+    if [ \"@DAILY_PATHS_SET@\" = \"1\" ]; then
         timeout --kill-after=30s 6h clamdscan --multiscan --fdpass \
                   --move=@QUARANTINE_DIR@ \
                   --log=\"$LOG_FILE\" \
@@ -107,15 +108,17 @@ distrobox enter -n @CONTAINER@ -- bash -c "
     fi
 "
 
-# record origin paths of newly quarantined files (restore-to-origin)
-while IFS= read -r t; do
-    b=$(basename "$t")
-    if [ -f "@QUARANTINE_DIR@/$b" ]; then
-        echo "$b|$t" >> "@TMP_DIR@/origins.tmp"
-    fi
-done <<'EOF'
-@DAILY_PATHS_CLEAN@
-EOF
+# record origins of newly quarantined files from the scan log's
+# "moved to" lines (restore-to-origin; works for folder scans and handles
+# duplicate names like libcef.dll / libcef.dll.001)
+sleep 1  # let clamd's --move settle so the quarantine file is visible
+tail -n +$((RUN_START + 1)) "$LOG_FILE" | grep "moved to" | while IFS= read -r line; do
+    src=$(printf '%s\n' "$line" | sed "s/ *: moved to .*//")
+    dst=$(printf '%s\n' "$line" | sed "s/.*moved to '//; s/'$//")
+    b=$(basename "$dst")
+    [ -n "$b" ] && [ -n "$src" ] && [ -f "@QUARANTINE_DIR@/$b" ] \
+        && echo "$b|$src|daily scan" >> "@TMP_DIR@/origins.tmp"
+done
 
 # Log clean-up: strip harmless container-layer housekeeping noise
 sed -i -e '/Not supported file type/d' \
@@ -159,6 +162,7 @@ fi
 
 bash @SCRIPT_DIR@/update.sh
 mkdir -p @TMP_DIR@ @QUARANTINE_DIR@
+RUN_START=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
 distrobox enter -n @CONTAINER@ -- bash -c "
     touch \"$LOCK_FILE\"
@@ -169,7 +173,7 @@ distrobox enter -n @CONTAINER@ -- bash -c "
         clamdscan --ping --wait > /dev/null 2>&1
     fi
 
-    if [ "@MONTHLY_PATHS_SET@" = "1" ]; then
+    if [ \"@MONTHLY_PATHS_SET@\" = \"1\" ]; then
         timeout --kill-after=30s 12h clamdscan --multiscan --fdpass \
                   --move=@QUARANTINE_DIR@ \
                   --log=\"$LOG_FILE\" \
@@ -186,15 +190,17 @@ distrobox enter -n @CONTAINER@ -- bash -c "
     fi
 "
 
-# record origin paths of newly quarantined files (restore-to-origin)
-while IFS= read -r t; do
-    b=$(basename "$t")
-    if [ -f "@QUARANTINE_DIR@/$b" ]; then
-        echo "$b|$t" >> "@TMP_DIR@/origins.tmp"
-    fi
-done <<'EOF'
-@MONTHLY_PATHS_CLEAN@
-EOF
+# record origins of newly quarantined files from the scan log's
+# "moved to" lines (restore-to-origin; works for folder scans and handles
+# duplicate names like libcef.dll / libcef.dll.001)
+sleep 1  # let clamd's --move settle so the quarantine file is visible
+tail -n +$((RUN_START + 1)) "$LOG_FILE" | grep "moved to" | while IFS= read -r line; do
+    src=$(printf '%s\n' "$line" | sed "s/ *: moved to .*//")
+    dst=$(printf '%s\n' "$line" | sed "s/.*moved to '//; s/'$//")
+    b=$(basename "$dst")
+    [ -n "$b" ] && [ -n "$src" ] && [ -f "@QUARANTINE_DIR@/$b" ] \
+        && echo "$b|$src|monthly scan" >> "@TMP_DIR@/origins.tmp"
+done
 
 sed -i -e '/Not supported file type/d' \
        -e '/traverse_to: Failed open/d' \
@@ -237,6 +243,7 @@ if ! flock -n 9; then
     notify-send -u low -i security-high "Horidoro AV" "Right-click scan skipped - another scan is already running." 2>/dev/null
     exit 0
 fi
+RUN_START=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 
 for TARGET in "$@"; do
     # Fedora Atomic mounts home at /var/home inside the container; on
@@ -266,11 +273,17 @@ for TARGET in "$@"; do
             rm -f \"$LOCK_FILE\"
         fi
     "
-    # record origin of a newly quarantined file (restore-to-origin)
-    b=$(basename "$TARGET")
-    if [ -f "@QUARANTINE_DIR@/$b" ]; then
-        echo "$b|$TARGET" >> "@TMP_DIR@/origins.tmp"
-    fi
+    # record origins of newly quarantined files from the scan log's
+    # "moved to" lines (restore-to-origin; works for folder targets too,
+    # handles duplicate names like libcef.dll / libcef.dll.001)
+    sleep 1  # let clamd's --move settle so the quarantine file is visible
+tail -n +$((RUN_START + 1)) "$LOG_FILE" | grep "moved to" | while IFS= read -r line; do
+        src=$(printf '%s\n' "$line" | sed "s/ *: moved to .*//")
+        dst=$(printf '%s\n' "$line" | sed "s/.*moved to '//; s/'$//")
+        b=$(basename "$dst")
+        [ -n "$b" ] && [ -n "$src" ] && [ -f "@QUARANTINE_DIR@/$b" ] \
+            && echo "$b|$src|right-click" >> "@TMP_DIR@/origins.tmp"
+    done
 done
 
 sed -i -e '/Not supported file type/d' \
@@ -484,6 +497,7 @@ if ! flock -n 9; then
     echo "[$(date)] skipped - another scan is already running" >> "$LOG_FILE"
     exit 0
 fi
+RUN_START=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
 distrobox enter -n @CONTAINER@ -- bash -c "
     touch \"$LOCK_FILE\"
     echo \"manual\" >> \"$LOCK_FILE\"
@@ -505,11 +519,17 @@ distrobox enter -n @CONTAINER@ -- bash -c "
     fi
 "
 
-# record origin of the quarantined file (restore-to-origin)
-b=$(basename "$TARGET")
-if [ -f "@QUARANTINE_DIR@/$b" ]; then
-    echo "$b|$TARGET" >> "@TMP_DIR@/origins.tmp"
-fi
+# record origins of newly quarantined files from the scan log's
+# "moved to" lines (restore-to-origin; works for folder targets too,
+# handles duplicate names like libcef.dll / libcef.dll.001)
+sleep 1  # let clamd's --move settle so the quarantine file is visible
+tail -n +$((RUN_START + 1)) "$LOG_FILE" | grep "moved to" | while IFS= read -r line; do
+    src=$(printf '%s\n' "$line" | sed "s/ *: moved to .*//")
+    dst=$(printf '%s\n' "$line" | sed "s/.*moved to '//; s/'$//")
+    b=$(basename "$dst")
+    [ -n "$b" ] && [ -n "$src" ] && [ -f "@QUARANTINE_DIR@/$b" ] \
+        && echo "$b|$src|manual scan" >> "@TMP_DIR@/origins.tmp"
+done
 
 sed -i -e '/Not supported file type/d' \
        -e '/traverse_to: Failed open/d' \

@@ -49,6 +49,14 @@ try:
     tabs = [w.notebook.get_tab_label(w.notebook.get_nth_page(i)).get_text()
             for i in range(w.notebook.get_n_pages())]
 
+    # Scan tab: the Stop button exists and starts disabled (a scan must be
+    # running before it can be stopped — the stop-scan feature, 2026-09-01).
+    assert hasattr(w, "scan_stop_btn"), "Stop scan button missing from Scan tab"
+    assert w.scan_stop_btn.get_sensitive() is False, \
+        "Stop scan button must start disabled"
+    assert w._scan_stopped is False, "_scan_stopped must start False"
+    print("STOP-SCAN BUTTON OK — present and disabled until a scan runs")
+
     # uninstalled: every switch REJECTS and snaps back to off. The snap-back
     # happens in an idle callback, so we process pending idles to really
     # verify it (the "Install first" loop/stuck-on bug class).

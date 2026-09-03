@@ -82,22 +82,55 @@ def scan_path(path, mode="quick"):
 
 
 # ---------------------------------------------------------------------------
+# force-stop a running scan (stuck / stale / too long)
+# ---------------------------------------------------------------------------
+def stop_scan():
+    """Stop any running Horidoro scan (manual, daily, monthly, right-click,
+    verbose) and release the scan lock so a new scan can start immediately.
+
+    Kills the scan script and its in-flight clamdscan/clamscan, then clears
+    the lock files Bouncer-safe: the watcher's hold on the engine is kept,
+    and the engine stops only when nothing holds it anymore. A crashed scan
+    can no longer leave an 'another scan is running' lock behind."""
+    for pat in ("scan_helper.sh", "daily_scan.sh", "monthly_scan.sh",
+                "right_click_scan.sh"):
+        run(f"pkill -f '[{pat[0]}]{pat[1:]}' 2>/dev/null")
+    distrobox("pkill -f '[c]lamdscan' 2>/dev/null; "
+              "pkill -f '[c]lamscan' 2>/dev/null")
+    lock = TMP_DIR / "horidoro_scan.lock"
+    distrobox(
+        f"sed -i '/daily/d;/monthly/d;/manual/d;/rightclick/d' '{lock}' "
+        f"2>/dev/null; "
+        f"if ! grep -q '[^[:space:]]' '{lock}' 2>/dev/null; then "
+        f"sudo pkill -9 clamd 2>/dev/null; rm -f '{lock}'; fi")
+    try:
+        (TMP_DIR / "horidoro_scan.lock.flock").unlink(missing_ok=True)
+    except OSError:
+        pass
+    return True
+
+
+# ---------------------------------------------------------------------------
 # quarantine
 # ---------------------------------------------------------------------------
 def list_quarantine():
-    """Return [{name, size, mtime}] — excluding clamd's internal lock files
-    and the app's own origin.json record (not user data)."""
+    """Return [{name, size, mtime, source}] — excluding clamd's internal lock
+    files and the app's own origin.json record (not user data).
+    `source` = what caught the file ('daily scan'/'watcher'/…), if known."""
     entries = []
     if not QUARANTINE_DIR.exists():
         return entries
     _merge_script_origins()  # pick up origins recorded by the scan scripts
+    origins = _load_origins()
     for f in sorted(QUARANTINE_DIR.iterdir()):
         if f.name.startswith(".clamav-quarantine-lock"):
             continue
         if f.name == "origin.json":  # the app's restore-origin record, not a threat
             continue
+        e = origins.get(f.name)
+        src = e.get("by") if isinstance(e, dict) else None
         entries.append({"name": f.name, "size": f.stat().st_size,
-                        "mtime": f.stat().st_mtime})
+                        "mtime": f.stat().st_mtime, "source": src})
     return entries
 
 
@@ -109,17 +142,30 @@ def delete_quarantined(name):
     return True
 
 
-def restore_quarantined(name, destination):
+def restore_quarantined(name, destination, replace=False):
     """Move a quarantined file to a chosen destination.
 
     The original location is NOT recorded by clamdscan --move, so restore
     goes to a user-chosen folder (or use restore_quarantined_to_origin when
-    an origin was recorded). Prunes the origin entry."""
+    an origin was recorded). Prunes the origin entry.
+
+    Uses shutil.move (not Path.rename): restore must work across drives
+    (e.g. a file that came from /var/mnt back to /var/mnt — rename would
+    fail with EXDEV on a different filesystem).
+
+    Never overwrites WITHOUT asking: if a file with the same name already
+    exists at the destination (re-downloaded/restored since quarantine),
+    returns False and leaves the file quarantined unless replace=True (the
+    GUI asks the user first)."""
     src = QUARANTINE_DIR / name
     dest = Path(destination)
     dest.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        src.rename(dest / name)
+    if not src.exists():
+        return False
+    target = dest / name
+    if target.exists() and not replace:
+        return False  # never clobber without asking
+    shutil.move(str(src), str(target))
     _forget_origin(name)
     return True
 
@@ -129,10 +175,15 @@ _ORIGIN_FILE = QUARANTINE_DIR / "origin.json"
 
 
 def _load_origins():
+    """origins dict: name -> {"path": str, "by": str|None}.
+    Legacy entries (plain strings) are normalized on load."""
     try:
         if _ORIGIN_FILE.exists():
             import json as _json
-            return _json.loads(_ORIGIN_FILE.read_text()) or {}
+            data = _json.loads(_ORIGIN_FILE.read_text()) or {}
+            return {k: (v if isinstance(v, dict)
+                        else {"path": v, "by": None})
+                    for k, v in data.items()}
     except (OSError, ValueError):
         pass
     return {}
@@ -154,11 +205,19 @@ def _forget_origin(name):
         _save_origins(origins)
 
 
-def record_origin(path):
-    """Record where a quarantined file came from (for restore-to-origin)."""
+def record_origin(path, by=None, name=None):
+    """Record where a quarantined file came from (restore-to-origin) and
+    what caught it — by='daily scan'/'monthly scan'/'manual scan'/
+    'right-click'/'watcher' (shown in the Quarantine tab).
+
+    `name` overrides the key when the quarantined copy's name differs from
+    the source basename (clamdscan appends .001 when the same filename is
+    quarantined twice) — the origin must be keyed by the ACTUAL quarantine
+    file name or restore can't find it."""
     try:
         origins = _load_origins()
-        origins[os.path.basename(path)] = str(path)
+        key = os.path.basename(path) if name is None else name
+        origins[key] = {"path": str(path), "by": by}
         _save_origins(origins)
     except OSError:
         pass
@@ -178,7 +237,7 @@ def _record_origins_from_log(log_path):
                 src = line.split(": ", 1)[0].strip()
                 b = os.path.basename(src)
                 if b and (QUARANTINE_DIR / b).exists():
-                    record_origin(src)
+                    record_origin(src, by="manual scan")
     except OSError:
         pass
 
@@ -192,10 +251,16 @@ def _merge_script_origins():
         origins = _load_origins()
         changed = False
         for line in tmp.read_text(errors="replace").splitlines():
-            if "|" in line:
-                name, path = line.split("|", 1)
-                if name and path and name not in origins:
-                    origins[name] = path
+            parts = line.split("|")
+            if len(parts) >= 2:
+                name, path = parts[0], parts[1]
+                by = parts[2] if len(parts) >= 3 else None  # legacy 2-field lines
+                if name and path:
+                    # scripts now write ONLY their own run's catches (RUN_START),
+                    # so a line here is NEWER than what origin.json holds —
+                    # overwrite (last line wins) so a stale record (same
+                    # filename caught earlier in a different folder) is corrected
+                    origins[name] = {"path": path, "by": by}
                     changed = True
         tmp.unlink(missing_ok=True)
         if changed:
@@ -207,23 +272,33 @@ def _merge_script_origins():
 def get_origin(name):
     """Recorded original path of a quarantined file, if known."""
     _merge_script_origins()
-    return _load_origins().get(name)
+    e = _load_origins().get(name)
+    return e.get("path") if isinstance(e, dict) else e
 
 
-def restore_quarantined_to_origin(name):
+def get_source(name):
+    """What caught a quarantined file ('daily scan'/'watcher'/…), if known."""
+    _merge_script_origins()
+    e = _load_origins().get(name)
+    return e.get("by") if isinstance(e, dict) else None
+
+
+def restore_quarantined_to_origin(name, replace=False):
     """Restore a quarantined file to its recorded original location.
-    Returns the restored path, or None (unknown origin / origin taken)."""
+    Returns the restored path, or None (unknown origin / origin taken and
+    replace not requested / error). The GUI asks the user before passing
+    replace=True — an existing file is never clobbered without asking."""
     origin = get_origin(name)
     if not origin:
         return None
     src = QUARANTINE_DIR / name
     dest = Path(origin)
     try:
-        if dest.exists():
-            return None  # don't clobber an existing file — use the chooser
+        if dest.exists() and not replace:
+            return None  # don't clobber an existing file — the GUI asks first
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src.exists():
-            src.rename(dest)
+            shutil.move(str(src), str(dest))  # cross-drive safe
         _forget_origin(name)
         return str(dest)
     except OSError:
@@ -446,7 +521,16 @@ def run_watcher_forever(state, extra_folders=(), stop_event=None,
             watch_append_log(f"{stamp}  {result.upper():8s}  {path}")
         if result == "infected":
             queue_infected(path)
-            record_origin(path)
+            # the quarantined copy's name can differ from the source (clamdscan
+            # appends .001 when the same filename lands twice) — key the origin
+            # by the ACTUAL moved name so restore can find it
+            qname = os.path.basename(path)
+            for line in (detail or "").splitlines():
+                if "moved to '" in line:
+                    dst = line.split("moved to '", 1)[1].rstrip("'")
+                    qname = os.path.basename(dst)
+                    break
+            record_origin(path, by="watcher", name=qname)
             _sweep_browser_partials(state, path)
         elif result == "error" and time.time() - last_error_notify[0] > 300:
             last_error_notify[0] = time.time()
@@ -987,17 +1071,19 @@ def build_bug_report(state=None):
         if tail and tail != "(no log yet)":
             lines.append(f"[{name}]")
             lines.append(tail[-keep:])
-    # install diagnostics — written to /tmp by a FAILED install (survives the
-    # automatic rollback); exactly the data needed to fix install bugs
-    debug_log = Path("/tmp/horidoro-install-debug.log")
-    if debug_log.exists():
+    # diagnostics — ANY /tmp/horidoro-*-debug.log gets included, so every
+    # error path reaches the bug report: a failed install writes
+    # horidoro-install-debug.log (survives the rollback), a failed Restore
+    # writes horidoro-restore-debug.log, etc.
+    import glob
+    for debug_log in sorted(glob.glob("/tmp/horidoro-*-debug.log")):
         try:
-            dbg = debug_log.read_text(errors="replace").strip()
+            dbg = open(debug_log, errors="replace").read().strip()
         except OSError:
             dbg = ""
         if dbg:
             lines.append("")
-            lines.append("--- install diagnostics (last failed install) ---")
+            lines.append(f"--- {os.path.basename(debug_log)} ---")
             lines.append(dbg[-4000:])
     lines.append("")
     lines.append("HORIDORO AV DIAGNOSTIC REPORT END")

@@ -80,11 +80,12 @@ Path("/tmp/horidoro-install-debug.log").write_text(
     "rootless-exec: rc=0\n")
 report2 = actions.build_bug_report(None)
 check("install diagnostics included in the report",
-      "install diagnostics" in report2 and "rootless-exec: rc=0" in report2)
+      "horidoro-install-debug.log" in report2
+      and "rootless-exec: rc=0" in report2)
 Path("/tmp/horidoro-install-debug.log").unlink(missing_ok=True)
 report3 = actions.build_bug_report(None)
-check("no diagnostics section when no failed install",
-      "install diagnostics" not in report3)
+check("no diagnostics section when no debug log exists",
+      "horidoro-install-debug.log" not in report3)
 
 print()
 if failures:

@@ -114,6 +114,81 @@ for _name, _tpl in (("update.sh", templates.UPDATE_SH),
     check(f"script parses: {_name}",
           subprocess.run(["bash", "-n", _f]).returncode == 0)
 
+# --- CRITICAL regression: rendered scripts with REAL scan paths -------------
+# The bug (found live in the daily/monthly scans 2026-08-30): unescaped
+# double quotes in the @DAILY_PATHS@/@MONTHLY_PATHS@ insertion terminated the
+# host-side `bash -c "..."` string, mangling the payload ("syntax error:
+# unexpected end of file from 'if' command on line 10" every night at 02:00).
+# A host-level `bash -n` alone CANNOT catch this — the host quotes balance
+# overall. The only true test: run the rendered script with a FAKE distrobox
+# in PATH that captures the exact string handed to the container's bash -c,
+# then syntax-check THAT. Real paths include spaces + digits ("WD 1TB nvme")
+# and hostile $ / backtick chars to prove both shells are handled.
+real_paths = ["/run/media/Misabi/1TB_HDD/Downloads",
+              "/run/media/Misabi/WD 1TB nvme/AppIMG",
+              "/run/media/Misabi/dollar$dir/thing",
+              "/run/media/Misabi/backtick`dir/x"]
+fakebin = os.path.join(sandbox, "fakebin")
+os.makedirs(fakebin, exist_ok=True)
+with open(os.path.join(fakebin, "distrobox"), "w") as f:
+    f.write("#!/bin/bash\n"
+            "# fake distrobox: capture what the container's bash -c would receive\n"
+            "args=(\"$@\")\n"
+            "for i in \"${!args[@]}\"; do\n"
+            "  if [ \"${args[$i]}\" = \"--\" ]; then shift $((i + 1)); break; fi\n"
+            "done\n"
+            "if [ \"$1\" = \"bash\" ] && [ \"$2\" = \"-c\" ]; then\n"
+            "  printf '%s' \"$3\" > \"$CAPTURE\"\n"
+            "fi\n")
+os.chmod(os.path.join(fakebin, "distrobox"), 0o755)
+with open(os.path.join(fakebin, "notify-send"), "w") as f:
+    f.write("#!/bin/bash\nexit 0\n")  # no-op: never spam real notifications
+os.chmod(os.path.join(fakebin, "notify-send"), 0o755)
+
+real_toks = {"LOG_DIR": os.path.join(sandbox, "h", "logs"),
+             "TMP_DIR": os.path.join(sandbox, "h", "tmp"),
+             "QUARANTINE_DIR": os.path.join(sandbox, "h", "q"),
+             "SCRIPT_DIR": os.path.join(sandbox, "h", "scripts"),
+             "SOUNDS_DIR": os.path.join(sandbox, "h", "sounds"),
+             "CONTAINER": "clamav",
+             "CONF": "/etc/clamd.d/scan.conf"}
+os.makedirs(real_toks["LOG_DIR"], exist_ok=True)
+os.makedirs(real_toks["TMP_DIR"], exist_ok=True)
+# pre-create the log so the script's post-scan cleanup can't fail
+open(os.path.join(real_toks["LOG_DIR"], "daily_scan.log"), "w").close()
+open(os.path.join(real_toks["LOG_DIR"], "monthly_full_scan.log"), "w").close()
+# render daily + monthly with the real paths (installer._tokens does the
+# DAILY_PATHS/_SET token work exactly as install/apply_config would)
+for _name, _tpl in (("daily_scan.sh", templates.DAILY_SH),
+                    ("monthly_scan.sh", templates.MONTHLY_SH)):
+    _rt = dict(real_toks)
+    _rt.update({"DAILY_PATHS": installer._path_lines(real_paths),
+                "DAILY_PATHS_SET": "1",
+                "MONTHLY_PATHS": installer._path_lines(real_paths),
+                "MONTHLY_PATHS_SET": "1"})
+    _s = _tpl
+    for _k, _v in _rt.items():
+        _s = _s.replace(f"@{_k}@", str(_v))
+    _f = os.path.join(sandbox, _name + ".real.sh")
+    open(_f, "w").write(_s)
+    # run the real script with the fake distrobox/notify-send in PATH
+    capture = os.path.join(sandbox, _name + ".captured.sh")
+    env = dict(os.environ)
+    env["PATH"] = fakebin + os.pathsep + env["PATH"]
+    env["CAPTURE"] = capture
+    subprocess.run(["bash", _f], env=env, capture_output=True, text=True)
+    got = open(capture).read() if os.path.exists(capture) else ""
+    check(f"payload captured: {_name}", bool(got.strip()), "no bash -c string")
+    check(f"inner payload parses: {_name}",
+          subprocess.run(["bash", "-n", capture],
+                         capture_output=True).returncode == 0,
+          "mangled payload = the daily/monthly 02:00 bug")
+    for _p in real_paths:
+        check(f"path intact in {_name}: {_p}",
+              ("'" + _p + "'") in got)
+    check(f"if-guard quoted in {_name}", '"1" = "1"' in got,
+          "unescaped guard quotes break the payload even with no paths")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURES: {failures}")

@@ -10,9 +10,9 @@ import os
 import sys
 import threading
 
-from branding import (APP_NAME, AUTHOR, DOCS_DIR, ENGINE_CREDIT, HOMEPAGE,
-                      PATREON_URL, STATE_FILE, TAGLINE, USDC_ADDRESS, VERSION,
-                      latest_changelog)
+from branding import (APP_NAME, AUTHOR, CONFIG_DIR, DOCS_DIR, ENGINE_CREDIT,
+                      HOMEPAGE, PATREON_URL, STATE_FILE, TAGLINE,
+                      USDC_ADDRESS, VERSION, latest_changelog)
 from state import State
 from shell import db_version, engine_status, run
 import actions
@@ -394,6 +394,15 @@ class MainWindow(Gtk.Window):
         self.scan_status = Gtk.Label(label="", xalign=0.0, wrap=True)
         srow.pack_start(self.scan_status, True, True, 0)
         box.pack_start(srow, False, False, 0)
+        # Stop button: cancels a stuck/long scan and releases the lock so a
+        # new scan can start right away (scheduled scans too).
+        stoprow = Gtk.Box(spacing=8)
+        self._scan_stopped = False
+        self.scan_stop_btn = Gtk.Button(label="Stop scan…")
+        self.scan_stop_btn.connect("clicked", self.on_stop_scan_clicked)
+        self.scan_stop_btn.set_sensitive(False)
+        stoprow.pack_start(self.scan_stop_btn, False, False, 0)
+        box.pack_start(stoprow, False, False, 0)
         hint = Gtk.Label(
             label="Quick scan uses the engine daemon and spreads the work across "
                   "all CPU cores — the everyday choice for folders. Verbose scan "
@@ -755,7 +764,12 @@ class MainWindow(Gtk.Window):
         _rc2, out2 = run("systemctl --user is-failed horidoro-watcher.service 2>/dev/null")
         is_failed = out2.strip() == "failed"
         enabled = bool(self.state.get("watcher_enabled"))
-        if is_failed:
+        # NOTE: no auto-STOP here. A stale app window (opened before the
+        # toggle was flipped) would see enabled=False and kill the watcher
+        # the user just started — the toggle is the only thing that starts
+        # and stops the service. (A 2026-09-02 self-heal version caused
+        # exactly that: 3 open windows stopped the watcher 1s after start.)
+        if is_failed and enabled:
             self.watcher_status.set_text(
                 "FAILED — the watcher crashed. Press Restart, then check the "
                 "event log below for the reason.")
@@ -778,8 +792,9 @@ class MainWindow(Gtk.Window):
         self.watcher_log.get_buffer().set_text(log)
 
     def _auto_refresh_watcher(self):
-        if self.state.get("watcher_enabled"):
-            self.refresh_watcher_status()
+        # always refresh (cheap is-active/is-failed) so the self-heal above
+        # stops a stale watcher even when the toggle is OFF
+        self.refresh_watcher_status()
         return True
 
     def on_restart_watcher(self, _w):
@@ -1518,6 +1533,8 @@ class MainWindow(Gtk.Window):
         if not target:
             return
         mode = "quick" if "Quick" in btn.get_label() else "verbose"
+        self._scan_stopped = False
+        self.scan_stop_btn.set_sensitive(True)
         self.scan_output.get_buffer().set_text(f"Scanning (mode: {mode}) — {target}\n\n")
         self.scan_spinner.start()
         self.scan_status.set_text("Scanning… this can take a while on large folders.")
@@ -1531,6 +1548,15 @@ class MainWindow(Gtk.Window):
         def done(out):
             self.scan_spinner.stop()
             self.engine_spinner.stop()
+            self.scan_stop_btn.set_sensitive(False)
+            if self._scan_stopped:
+                self.scan_status.set_markup(
+                    "<span color='#2e9e4f'>✓ Scan stopped — you can start a "
+                    "new one now</span>")
+                self.scan_output.get_buffer().set_text(
+                    "Scan stopped by you — the scan lock was released, so "
+                    "a new scan can start immediately.\n")
+                return
             self._status_engine.set_markup(
                 "<span color='#2e9e4f'>✓ On — Idle</span>")
             text = out or ""
@@ -1566,6 +1592,28 @@ class MainWindow(Gtk.Window):
             buf.insert(buf.get_end_iter(), text[-40000:])
 
         self._threaded(work, done)
+
+    def on_stop_scan_clicked(self, _w):
+        self._confirm(
+            "Stop the scan?",
+            "This cancels the running scan (scheduled or manual) and releases "
+            "the scan lock so you can start a new one right away. Anything "
+            "already quarantined stays in quarantine.",
+            self._do_stop_scan, yes_label="Stop scan")
+
+    def _do_stop_scan(self):
+        self._scan_stopped = True
+        self.scan_stop_btn.set_sensitive(False)
+        self.scan_spinner.stop()
+        self.engine_spinner.stop()
+        self.scan_status.set_markup(
+            "<span color='#2e9e4f'>✓ Stopping scan…</span>")
+        try:
+            actions.stop_scan()
+        except Exception:  # noqa: BLE001 — best-effort stop
+            pass
+        self.scan_status.set_markup(
+            "<span color='#2e9e4f'>✓ Scan stopped — you can start a new one now</span>")
 
     def on_install_clicked(self, _w):
         if self._busy:
@@ -1843,16 +1891,22 @@ class MainWindow(Gtk.Window):
 
     # --- quarantine ----------------------------------------------------------
     def refresh_quarantine(self):
-        self.quarantine_list.foreach(lambda w: self.quarantine_list.remove(w))
-        for e in actions.list_quarantine():
-            row = Gtk.ListBoxRow()
-            cb = Gtk.CheckButton(
-                label=f"{e['name']}   ({e['size']/1024:.0f} KB)")
-            cb.set_active(False)
-            row.add(cb)
-            row._entry = e  # stash for the handlers
-            row._cb = cb
-            self.quarantine_list.add(row)
+        for child in self.quarantine_list.get_children():
+            self.quarantine_list.remove(child)
+        try:
+            for e in actions.list_quarantine():
+                row = Gtk.ListBoxRow()
+                src = e.get("source")
+                src_txt = f"  ({src})" if src else ""
+                cb = Gtk.CheckButton(
+                    label=f"{e['name']}{src_txt}   ({e['size']/1024:.0f} KB)")
+                cb.set_active(False)
+                row.add(cb)
+                row._entry = e  # stash for the handlers
+                row._cb = cb
+                self.quarantine_list.add(row)
+        except Exception:  # noqa: BLE001 — never let the list freeze empty
+            pass
         self.quarantine_list.show_all()
 
     def _auto_refresh_quarantine(self):
@@ -1887,61 +1941,141 @@ class MainWindow(Gtk.Window):
         names = self._selected_quarantine()
         if not names:
             return
-        origins = {actions.get_origin(n) for n in names}
-        common_origin = origins.pop() if len(origins) == 1 else None
-        if not common_origin:
-            common_origin = None
+        # Mixed multi-restore: files with a recorded, still-free origin go
+        # back to THEIR OWN location automatically; files whose origin is
+        # already occupied were re-downloaded/restored since quarantine
+        # (nothing to restore — never clobber); the rest need one folder
+        # choice.
+        with_origin, no_origin, origin_taken = [], [], []
+        for n in names:
+            o = actions.get_origin(n)
+            if o and not os.path.exists(o):
+                with_origin.append((n, o, actions.get_source(n)))
+            elif o:
+                origin_taken.append((n, o))  # recorded, but already back there
+            else:
+                no_origin.append(n)
+
+        if not (with_origin or no_origin or origin_taken):
+            return
+
         dlg = Gtk.Dialog(title="Restore", transient_for=self, modal=True)
-        dlg.set_default_size(580, 200)
+        dlg.set_default_size(600, 360)
         area = dlg.get_content_area()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for side in ("margin_start", "margin_end", "margin_top", "margin_bottom"):
             getattr(box, "set_" + side)(12)
-        if common_origin:
-            lab = Gtk.Label(
-                label=f"Restore to its original location?\n\n{common_origin}\n\n"
-                      "Or choose a different folder.",
-                wrap=True, xalign=0.0)
-        else:
-            lab = Gtk.Label(
-                label="The original location isn't recorded for this file — "
-                      "choose a folder to restore to.",
-                wrap=True, xalign=0.0)
-        box.pack_start(lab, False, False, 0)
-        cb = Gtk.CheckButton(
-            label="Also add the restored location to Exclusions "
-                  "(so it isn't flagged again)")
-        cb.set_active(True)
-        box.pack_start(cb, False, False, 0)
+        # plain summary + a simple multi-line list — no expander/scrolled-
+        # window wrappers (they rendered unreliably on some desktops)
+        lines = []
+        for n, o, src in with_origin:
+            who = f" ({src})" if src else ""
+            lines.append(f"• {n}{who} → back to:\n  {o}")
+        for n, o in origin_taken:
+            lines.append(f"• {n} → already exists at:\n  {o}\n  (will ask before replacing)")
+        for n in no_origin:
+            lines.append(f"• {n} → no recorded origin (you'll choose a folder)")
+        cap = 15
+        shown = "\n\n".join(lines[:cap])
+        if len(lines) > cap:
+            shown += f"\n\n…and {len(lines) - cap} more (same choices apply)."
+        lab = Gtk.Label(label=shown, xalign=0.0, wrap=True, selectable=True,
+                        justify=Gtk.Justification.LEFT)
+        box.pack_start(lab, True, True, 0)
+        # watcher-caught files: the recorded path is just where the file
+        # LANDED (often Downloads) — be honest that it may not be home
+        if any(src == "watcher" for _n, _o, src in with_origin):
+            box.pack_start(Gtk.Label(
+                label="Note: watcher-caught files were recorded where they "
+                      "landed (often Downloads). Restore there only if that's "
+                      "really where they belong.",
+                wrap=True, xalign=0.0), False, False, 0)
         area.pack_start(box, True, True, 0)
         dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        if common_origin:
-            dlg.add_button("Choose a folder…", Gtk.ResponseType.APPLY)
-            dlg.add_button("Restore to original", Gtk.ResponseType.OK)
-        else:
+        if no_origin:
             dlg.add_button("Choose a folder…", Gtk.ResponseType.ACCEPT)
+        if with_origin or origin_taken:
+            dlg.add_button("Restore", Gtk.ResponseType.OK)
+        dlg.show_all()  # CRITICAL: custom Gtk.Dialog content never shows without it
         resp = dlg.run()
 
         restored_paths = []
-        if resp == Gtk.ResponseType.OK and common_origin:
-            for n in names:
-                p = actions.restore_quarantined_to_origin(n)
-                if p:
-                    restored_paths.append(p)
-        elif resp in (Gtk.ResponseType.ACCEPT, Gtk.ResponseType.APPLY):
-            fc = Gtk.FileChooserDialog("Restore to folder", dlg,
-                                       Gtk.FileChooserAction.SELECT_FOLDER,
-                                       (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                                        Gtk.STOCK_OPEN, Gtk.ResponseType.OK))
-            if fc.run() == Gtk.ResponseType.OK:
-                dest = fc.get_filename()
-                for n in names:
-                    actions.restore_quarantined(n, dest)
-                    restored_paths.append(os.path.join(dest, n))
-            fc.destroy()
-        dlg.destroy()
-        if restored_paths and cb.get_active():
-            self._add_exclusions(restored_paths)
+        failed = []
+        try:
+            def ask_replace(name, target):
+                """If a file already sits at the target, ASK before replacing
+                it. Returns True when replacement is approved."""
+                if not os.path.exists(target):
+                    return True
+                decision = [False]
+                self._confirm(
+                    "Replace the existing file?",
+                    f"'{name}' already exists at:\n{target}\n\n"
+                    "That copy is probably newer (re-downloaded or restored "
+                    "earlier). Replace it with the quarantined one?",
+                    lambda: decision.__setitem__(0, True),
+                    yes_label="Replace")
+                return decision[0]
+
+            def _restore_origin(n, o):
+                if ask_replace(n, o):
+                    p = actions.restore_quarantined_to_origin(
+                        n, replace=True)
+                    if p:
+                        restored_paths.append(p)
+                    else:
+                        failed.append(f"{n} (nothing to restore or the move "
+                                     "failed)")
+                else:
+                    failed.append(f"{n} (kept in quarantine)")
+
+            if resp == Gtk.ResponseType.OK:
+                for n, o, _src in with_origin:
+                    _restore_origin(n, o)
+                for n, o in origin_taken:
+                    _restore_origin(n, o)
+            elif resp == Gtk.ResponseType.ACCEPT and no_origin:
+                fc = Gtk.FileChooserDialog("Restore to folder", dlg,
+                                           Gtk.FileChooserAction.SELECT_FOLDER,
+                                           (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                                            Gtk.STOCK_OPEN, Gtk.ResponseType.OK))
+                if fc.run() == Gtk.ResponseType.OK:
+                    dest = fc.get_filename()
+                    for n in no_origin:
+                        target = os.path.join(dest, n)
+                        if ask_replace(n, target) and actions.restore_quarantined(
+                                n, dest, replace=True):
+                            restored_paths.append(target)
+                        else:
+                            failed.append(n)
+                fc.destroy()
+            dlg.destroy()
+            # ALWAYS show where the files went (never a silent outcome)
+            if restored_paths:
+                self.show_notice(
+                    "Restored",
+                    "Restored:\n" + "\n".join("• " + p for p in restored_paths))
+                # explicit ask — never silently add to Exclusions
+                self._confirm(
+                    "Add to Exclusions?",
+                    f"Restored {len(restored_paths)} file(s).\n\n"
+                    "Also add their locations to the Exclusions list so they "
+                    "aren't flagged again in future scans?",
+                    lambda: self._add_exclusions(restored_paths),
+                    yes_label="Yes, exclude them")
+            if failed:
+                self.show_notice("Couldn't restore",
+                                 "Not restored (they stay in quarantine):\n"
+                                 + "\n".join("• " + f for f in failed))
+        except Exception as e:  # noqa: BLE001 — never swallow GUI errors silently
+            import traceback
+            try:
+                open("/tmp/horidoro-restore-debug.log", "w").write(
+                    traceback.format_exc())
+            except Exception:  # noqa: BLE001
+                pass
+            self.show_notice("Restore failed",
+                             f"Something went wrong: {e}")
         self.refresh_quarantine()
         self.refresh_status()
 
@@ -2331,6 +2465,21 @@ def main():
     if not HAVE_GTK:
         print(f"{APP_NAME} needs GTK3 (python3-gobject). Install it and retry.")
         raise SystemExit(1)
+    # Only ONE GUI window at a time: an exclusive flock on a lock file in the
+    # config dir. A second launch shows a notice and exits instead of opening
+    # a duplicate window (duplicate instances caused the watcher toggle to
+    # fight itself). Headless modes (--watch/--update-check above) never take
+    # this lock.
+    try:
+        import fcntl
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _lock_f = open(CONFIG_DIR / "gui.lock", "w")
+        fcntl.flock(_lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        globals()["_gui_lock_f"] = _lock_f  # keep the fd alive (holds the lock)
+    except OSError:
+        print(f"{APP_NAME} is already open — look for its window.",
+              file=sys.stderr)
+        raise SystemExit(0)
     state = State()
     # First run: register the apps-menu entry so it's launchable like any app.
     ensure_self_installed(state)

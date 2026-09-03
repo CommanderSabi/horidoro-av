@@ -100,12 +100,25 @@ def _monthly_calendar(monthly):
 def _path_lines(paths, indent="              "):
     """Format a scan path list for script insertion (quote-armored).
     Empty list -> empty string (no implicit default: the user chooses what
-    gets scanned; scripts skip with a notification when nothing is set)."""
+    gets scanned; scripts skip with a notification when nothing is set).
+
+    CRITICAL: the output lands INSIDE the generated scripts' double-quoted
+    `bash -c "..."` distrobox payload, so the path must survive TWO shells:
+      - the HOST shell (the payload is a double-quoted string: $, `, \\, "
+        must be escaped for it)
+      - the CONTAINER's bash (single-quote the path so $, `, \\ are literal;
+        the '"';"' idiom carries a literal single quote through safely)
+    An unescaped quote terminates the outer string and collapses the whole
+    payload (the recurring CRITICAL BUG #3 class — found live in the
+    daily/monthly scans: "syntax error: unexpected end of file from 'if'")."""
     paths = [str(p) for p in paths if p]
     lines = []
     for i, p in enumerate(paths):
         end = " \\" if i < len(paths) - 1 else ""
-        lines.append(f'{indent}"{p}"{end}')
+        inner = "'" + p.replace("'", "'\"'\"'") + "'"  # single-quoted for the inner shell
+        safe = (inner.replace("\\", "\\\\").replace('"', '\\"')
+                 .replace("$", "\\$").replace("`", "\\`"))  # host-shell escaping
+        lines.append(f'{indent}{safe}{end}')
     return "\n".join(lines)
 
 
