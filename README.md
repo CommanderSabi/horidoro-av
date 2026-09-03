@@ -2,7 +2,7 @@
 
 **Local-first protection. Commander-approved.**
 
-**Website:** [horidoro.gt.tc](https://horidoro.gt.tc)
+**Website:** [horidoro.com](https://horidoro.com)
 
 Horidoro AV is a free, open-source antivirus for Linux that makes protection
 simple — especially for people who are new to Linux. One double-click to
